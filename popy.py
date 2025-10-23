@@ -25,6 +25,8 @@ Created on Sat Jan 26 15:50:30 2019
 """
 
 import numpy as np
+import self
+
 np.seterr(divide='ignore', invalid='ignore')
 import datetime
 import os, sys, glob
@@ -2754,6 +2756,45 @@ class popy(object):
             self.min_qa_value = 0.5
             self.pixel_shape = 'quadrilateral'
             self.default_column_unit = 'mol/m2'
+
+        elif(instrum == "GOSAT"):
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
+            error_model = "square"
+            if product in ['CH4']:
+                oversampling_list = ['XCH4','albedo',\
+                                     'surface_altitude']
+                self.default_subset_function = 'F_subset_GOSATCH4'
+            if product in ['CO2']:
+                oversampling_list = ['XC02','column_amount','albedo',\
+                                     'surface_altitude']
+                self.default_subset_function = 'F_subset_GOSATCO2'
+            xmargin = 2
+            ymargin = 2
+            maxsza = 70
+            maxcf = 0.3
+            self.pixel_shape = 'elliptical'  # GOSAT 使用圆形像素
+            self.default_column_unit = 'nmol/mol'  # 或 'molec/cm2',取决于产品
+
+        elif (instrum == "OCO-2"):
+             k1 = k1 or 4  # Super-Gaussian shape exponent for horizontal direction
+             k2 = k2 or 2  # Super-Gaussian shape exponent for vertical direction
+             k3 = k3 or 1  # Super-Gaussian shape exponent for the combined axis
+             error_model = "linear"  # Error model for OCO-2 (linear for UV/Visible spectrometers)
+             xmargin = 1.5  # Horizontal pixel overlap margin
+             ymargin = 1.5  # Vertical pixel overlap margin
+             maxsza = 80  # Maximum solar zenith angle (OCO-2 is sensitive to SZA)
+             maxcf = 0.3  # Maximum cloud fraction for valid data (OCO-2 uses 0.3)
+             self.pixel_shape = 'quadrilateral'  # OCO-2 typically uses an elliptical pixel shape
+             if product in ['CO2']:
+                self.default_subset_function = 'F_subset_OCO2_CO2'  # Set the subsetting function for CO2 product
+                oversampling_list = ['XCO2', 'surface_altitude', 'cloud_fraction', 'terrain_height']
+                self.default_column_unit = 'umol/mol'  # Units for CO2 product (ppm)
+             elif product in ['CH4']:
+                self.default_subset_function = 'F_subset_OCO2_CH4'  # Set the subsetting function for CH4 product
+                oversampling_list = ['XCH4', 'surface_altitude', 'cloud_fraction', 'terrain_height']
+                self.default_column_unit = 'nmol/mol'  # Units for CH4 product
         elif(instrum == "IASI"):
             k1 = k1 or 2
             k2 = k2 or 2
@@ -3257,7 +3298,7 @@ class popy(object):
         return l3_data
     def F_read_S5P_nc(self,fn,data_fields,data_fields_l2g=None):
         """ 
-        function to read tropomi's level 2 netcdf file to a dictionary
+        function to read tropo mi's level 2 netcdf file to a dictionary
         fn: file name
         data_fields: a list of string containing absolution path of variables to extract
         data_fields_l2g: what do you want to call the variables in the output
@@ -4023,7 +4064,7 @@ class popy(object):
             if l2_list is not None and l2_path_pattern is not None:
                 self.logger.info('both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten')
                 l2_path_pattern = None
-            
+
             if l2_list is None:
                 import glob
                 l2_list = []
@@ -4033,7 +4074,7 @@ class popy(object):
                 DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
                 for DATE in DATES:
                     flist = glob.glob(DATE.strftime(l2_path_pattern))
-                    l2_list = l2_list+flist                 
+                    l2_list = l2_list+flist
             self.l2_list = l2_list
         maxsza = self.maxsza
         maxcf = self.maxcf
@@ -4116,7 +4157,160 @@ class popy(object):
             self.nl2 = 0
         else:
             self.nl2 = len(l2g_data['latc'])
-            
+
+
+    def F_subset_OCO2_CO2(self,l2_list=None,
+                          l2_path_pattern=None,
+                          path=None,
+                          data_fields=None,
+                          data_fields_l2g=None,
+                          use_merra2=False,
+                          merra2_interp_variables=None,
+                          merra2_dir='./',
+                          use_geosfp=False,
+                          geos_interp_variables=None,
+                          geos_time_collection=''):
+        """
+        Subset OCO-2 CO2 Level-2 (Lite) data:
+          - read minimal set of OCO-2 L2 variables (XCO2, QA, lat/lon, time, corners if available)
+          - apply region/time/QA screening
+
+        Parameters
+        ----------
+        l2_list : list[str] or None
+            Full paths to OCO-2 L2 files. If given, l2_path_pattern is ignored.
+        l2_path_pattern : str or None
+            A strftime pattern for daily expansion (e.g., r'/data/oco2/L2/oco2_LtCO2_%Y%m%d_*.nc4')
+        path : str or None
+            Directory containing L2 files (not recommended; prefer l2_list/l2_path_pattern).
+        data_fields : list[str] or None
+            Absolute variable paths to read. If None, sensible defaults are used.
+        data_fields_l2g : list[str] or None
+            Standardized names mapped one-to-one to data_fields.
+        maxsza : float, optional
+            Maximum solar zenith angle to retain valid data (default is 90).
+        maxcf : float, optional
+            Maximum cloud fraction to retain valid data (default is 0.3).
+        west, east, south, north : float, optional
+            Geographic bounding box for valid data (default is global: [-180, 180, -90, 90]).
+        min_qa_value : float, optional
+            Minimum QA value to keep the observation (default is 0, meaning high quality data only).
+        start_datetime : datetime, optional
+            Start date-time for filtering (if None, no filtering).
+        end_datetime : datetime, optional
+            End date-time for filtering (if None, no filtering).
+        """
+        # Initialize l2_list if path is provided
+        if path is not None:
+            self.logger.warning('Please use l2_list or l2_path_pattern instead')
+            import glob
+            l2_dir = path
+            l2_list = []
+            cwd = os.getcwd()
+            os.chdir(l2_dir)
+            start_date = self.start_python_datetime.date()
+            end_date = self.end_python_datetime.date()
+            days = (end_date - start_date).days + 1
+            DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+            for DATE in DATES:
+                flist = glob.glob('oco2_LtCO2_' + DATE.strftime("%Y%m%d") + 'T*.nc4')
+                l2_list = l2_list + flist
+            os.chdir(cwd)
+            self.l2_dir = l2_dir
+            self.l2_list = l2_list
+        else:
+            if l2_list is None and l2_path_pattern is None:
+                self.logger.error('Either l2_list or l2_path_pattern must be provided!')
+                return
+            if l2_list is not None and l2_path_pattern is not None:
+                self.logger.info('Both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten.')
+                l2_path_pattern = None
+            if l2_list is None:
+                import glob
+                l2_list = []
+                start_date = self.start_python_datetime.date()
+                end_date = self.end_python_datetime.date()
+                days = (end_date - start_date).days + 1
+                DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+                for DATE in DATES:
+                    flist = glob.glob(DATE.strftime(l2_path_pattern))
+                    l2_list = l2_list + flist
+            self.l2_list = l2_list
+        maxsza = self.maxsza
+        maxcf = self.maxcf
+        west = self.west
+        east = self.east
+        south = self.south
+        north = self.north
+        min_qa_value = self.min_qa_value
+        # Define default data fields to read from the OCO-2 L2 files if not provided
+        if not data_fields:
+            data_fields = [
+                'latitude', 'longitude', 'xco2', 'xco2_uncertainty', 'xco2_quality_flag',
+                'sounding_id', 'time', 'vertex_latitude', 'vertex_longitude', 'sensor_zenith_angle',
+                'solar_zenith_angle','pressure_weight', 'pressure_levels'
+            ]
+        if not data_fields_l2g:
+            data_fields_l2g = [
+                'latc', 'lonc', 'XCO2', 'column_uncertainty', 'qa_value', 'sounding_id','time', 'vertex_latitude',
+                'vertex_longitude','sensor_zenith_angle',
+                'solar_zenith_angle','pressure_weight', 'pressure_levels'
+            ]
+
+        # Start processing files and applying filters
+        self.logger.info('Read, subset, and store OCO-2 L2 CO2 data into l2g_data')
+        l2g_data = {}
+
+        for fn in l2_list:
+            fn_path = os.path.join(l2_dir,fn)
+            self.logger.info('Loading '+fn)
+            try:
+                outp = F_ncread_selective(fn_path, data_fields, data_fields_l2g)
+            except Exception as e:
+                self.logger.warning(f'{fn} gives error: {e}')
+                continue
+
+            # Apply filters for solar zenith angle (SZA), cloud fraction, and QA value
+            f1 = outp['solar_zenith_angle'] <= maxsza
+            f2 = outp['cloud_fraction'] <= maxcf
+            f3 = outp['qa_value'] >= min_qa_value
+            f4 = outp['latc'] >= south
+            f5 = outp['latc'] <= north
+            tmplon = outp['lonc'] - west
+            tmplon[tmplon < 0] = tmplon[tmplon < 0] + 360
+            f6 = tmplon >= 0
+            f7 = tmplon <= east - west
+
+            # Apply time filter if given
+            f8 = outp['UTC_matlab_datenum'] >= self.start_matlab_datenum
+            f9 = outp['UTC_matlab_datenum'] <= self.end_matlab_datenum
+            validmask = f1 & f2 & f3 & f4 & f5 & f6 & f7 & f8 & f9
+            self.logger.info(f'You have {np.sum(validmask)} valid L2 pixels')
+
+            l2g_data0 = {}
+            Lat_lowerleft = np.squeeze(outp['vertex_latitude'][:, :, 0])[validmask]
+            Lat_upperleft = np.squeeze(outp['vertex_latitude'][:, :, 3])[validmask]
+            Lat_lowerright = np.squeeze(outp['vertex_latitude'][:, :, 1])[validmask]
+            Lat_upperright = np.squeeze(outp['vertex_latitude'][:, :, 2])[validmask]
+            Lon_lowerleft = np.squeeze(outp['vertex_longitude'][:, :, 0])[validmask]
+            Lon_upperleft = np.squeeze(outp['vertex_longitude'][:, :, 3])[validmask]
+            Lon_lowerright = np.squeeze(outp['vertex_longitude'][:, :, 1])[validmask]
+            Lon_upperright = np.squeeze(outp['vertex_longitude'][:, :, 2])[validmask]
+            l2g_data0['latr'] = np.column_stack((Lat_lowerleft, Lat_upperleft, Lat_upperright, Lat_lowerright))
+            l2g_data0['lonr'] = np.column_stack((Lon_lowerleft, Lon_upperleft, Lon_upperright, Lon_lowerright))
+
+            for key in outp.keys():
+                if key not in {'vertex_latitude', 'vertex_longitude', 'time'}:
+                    l2g_data0[key] = outp[key][validmask]
+
+            l2g_data = self.F_merge_l2g_data(l2g_data, l2g_data0)
+
+        self.l2g_data = l2g_data
+        if not l2g_data:
+            self.nl2 = 0
+        else:
+            self.nl2 = len(l2g_data['latc'])
+
     def F_subset_S5PHCHO(self,l2_list=None,l2_path_pattern=None,
                          path=None,data_fields=None,data_fields_l2g=None,
                          s5p_product='*',geos_interp_variables=None,
